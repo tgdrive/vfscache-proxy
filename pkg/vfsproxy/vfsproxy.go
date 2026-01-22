@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 
 	"github.com/tgdrive/vfscache-proxy/backend/link"
 
@@ -29,11 +31,10 @@ type Options struct {
 	CacheChunkStreams int
 	StripQuery        bool
 	StripDomain       bool
-	MetadataCacheSize int
+	MetadataCacheSize string
 
 	// Additional VFS Options
 	CacheMode         string
-	CachePollInterval string
 	WriteWait         string
 	ReadWait          string
 	WriteBack         string
@@ -54,33 +55,23 @@ type Handler struct {
 }
 
 func NewHandler(opt Options) (*Handler, error) {
-	// Initialize global link cache
-	if opt.MetadataCacheSize > 0 {
-		link.InitCache(opt.MetadataCacheSize)
-	}
 
 	regInfo, _ := fs.Find("link")
 	if regInfo == nil {
 		return nil, fmt.Errorf("could not find link backend")
 	}
 
-	// Backend options
 	backendOpt := configmap.Simple{
 		"strip_query":  fmt.Sprintf("%v", opt.StripQuery),
 		"strip_domain": fmt.Sprintf("%v", opt.StripDomain),
+		"cache_size":   fmt.Sprintf("%v", opt.MetadataCacheSize),
 	}
 
-	fsName := opt.FsName
-	if fsName == "" {
-		fsName = "vfs-streaming-proxy"
-	}
-
-	f, err := regInfo.NewFs(context.Background(), fsName, "", backendOpt)
+	f, err := regInfo.NewFs(context.Background(), opt.FsName, "", backendOpt)
 	if err != nil {
 		return nil, err
 	}
 
-	// Map flags to Rclone VFS options
 	m := configmap.Simple{
 		"vfs_cache_mode":           opt.CacheMode,
 		"vfs_cache_max_age":        opt.CacheMaxAge,
@@ -88,7 +79,6 @@ func NewHandler(opt Options) (*Handler, error) {
 		"vfs_read_chunk_size":      opt.CacheChunkSize,
 		"dir_cache_time":           opt.DirCacheTime,
 		"vfs_read_chunk_streams":   fmt.Sprintf("%d", opt.CacheChunkStreams),
-		"vfs_cache_poll_interval":  opt.CachePollInterval,
 		"vfs_write_wait":           opt.WriteWait,
 		"vfs_read_wait":            opt.ReadWait,
 		"vfs_write_back":           opt.WriteBack,
@@ -103,7 +93,6 @@ func NewHandler(opt Options) (*Handler, error) {
 		"file_perms":               opt.FilePerms,
 	}
 
-	// Set defaults if empty
 	if m["vfs_cache_mode"] == "" {
 		m["vfs_cache_mode"] = "full"
 	}
@@ -116,12 +105,10 @@ func NewHandler(opt Options) (*Handler, error) {
 		return nil, fmt.Errorf("failed to parse VFS options: %w", err)
 	}
 
-	// Setup Cache Directory
 	actualCacheDir := opt.CacheDir
 	if actualCacheDir == "" {
 		actualCacheDir = filepath.Join(os.TempDir(), "rclone_vfs_cache")
 	}
-	// Note: This sets the global Rclone config cache dir.
 	_ = config.SetCacheDir(actualCacheDir)
 
 	vfsInstance := vfs.New(f, &vfsOpt)
@@ -132,9 +119,6 @@ func (h *Handler) Shutdown() {
 	h.VFS.Shutdown()
 }
 
-// Serve handles the VFS streaming for a specific target URL.
-// It is intended to be called by a frontend (main.go or Caddy plugin)
-// that has already resolved the target URL.
 func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string) {
 	if targetURL == "" {
 		http.Error(w, "Target URL is required", http.StatusBadRequest)
@@ -143,23 +127,76 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string
 
 	hashBytes := md5.Sum([]byte(targetURL))
 	fileHash := fmt.Sprintf("%x", hashBytes)
-
-	log.Printf("VFS Serve: %s -> %s", targetURL, fileHash)
 	link.Register(fileHash, targetURL)
 
-	handle, err := h.VFS.OpenFile(fileHash, os.O_RDONLY, 0)
-	if err != nil {
-		log.Printf("VFS error: %v", err)
-		http.Error(w, "File error", http.StatusNotFound)
+	h.ServeFile(w, r, fileHash)
+}
+
+func (h *Handler) ServeFile(w http.ResponseWriter, r *http.Request, remote string) {
+	ctx := r.Context()
+	node, err := h.VFS.Stat(remote)
+	if err == vfs.ENOENT {
+		fs.Infof(remote, "%s: File not found", r.RemoteAddr)
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "Failed to find file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer handle.Close()
-
-	info, err := handle.Stat()
-	if err != nil {
-		http.Error(w, "Stat error", http.StatusInternalServerError)
+	if !node.IsFile() {
+		http.Error(w, "Not a file", http.StatusNotFound)
 		return
 	}
 
-	http.ServeContent(w, r, fileHash, info.ModTime(), handle)
+	entry := node.DirEntry()
+	if entry == nil {
+		http.Error(w, "Can't open file being written", http.StatusNotFound)
+		return
+	}
+	obj := entry.(fs.Object)
+	file := node.(*vfs.File)
+
+	knownSize := obj.Size() >= 0
+	if knownSize {
+		w.Header().Set("Content-Length", strconv.FormatInt(node.Size(), 10))
+	}
+
+	mimeType := fs.MimeType(ctx, obj)
+	if mimeType == "application/octet-stream" && path.Ext(remote) == "" {
+	} else {
+		w.Header().Set("Content-Type", mimeType)
+	}
+
+	w.Header().Set("Last-Modified", file.ModTime().UTC().Format(http.TimeFormat))
+
+	if r.Method == "HEAD" {
+		return
+	}
+
+	// open the object
+	in, err := file.Open(os.O_RDONLY)
+	if err != nil {
+		http.Error(w, "Failed to open file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer func() {
+		err := in.Close()
+		if err != nil {
+			fs.Errorf(remote, "Failed to close file: %v", err)
+		}
+	}()
+
+	if knownSize {
+		http.ServeContent(w, r, remote, node.ModTime(), in)
+	} else {
+		if rangeRequest := r.Header.Get("Range"); rangeRequest != "" {
+			http.Error(w, "Can't use Range: on files of unknown length", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		n, err := io.Copy(w, in)
+		if err != nil {
+			fs.Errorf(obj, "Didn't finish writing GET request (wrote %d/unknown bytes): %v", n, err)
+			return
+		}
+	}
 }

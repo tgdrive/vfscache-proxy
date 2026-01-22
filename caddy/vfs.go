@@ -31,11 +31,10 @@ type VFS struct {
 	CacheChunkStreams int    `json:"cache_chunk_streams,omitempty"`
 	StripQuery        bool   `json:"strip_query,omitempty"`
 	StripDomain       bool   `json:"strip_domain,omitempty"`
-	MetadataCacheSize int    `json:"metadata_cache_size,omitempty"`
+	MetadataCacheSize string `json:"metadata_cache_size,omitempty"`
 
 	// New Options
 	CacheMode         string `json:"cache_mode,omitempty"`
-	CachePollInterval string `json:"cache_poll_interval,omitempty"`
 	WriteWait         string `json:"write_wait,omitempty"`
 	ReadWait          string `json:"read_wait,omitempty"`
 	WriteBack         string `json:"write_back,omitempty"`
@@ -66,20 +65,6 @@ func (VFS) CaddyModule() caddy.ModuleInfo {
 func (v *VFS) Provision(ctx caddy.Context) error {
 	v.logger = ctx.Logger(v)
 
-	// Set defaults
-	if v.CacheMaxAge == "" {
-		v.CacheMaxAge = "1h"
-	}
-	if v.CacheMaxSize == "" {
-		v.CacheMaxSize = "off"
-	}
-	if v.CacheChunkSize == "" {
-		v.CacheChunkSize = "64M"
-	}
-	if v.CacheChunkStreams == 0 {
-		v.CacheChunkStreams = 2
-	}
-
 	opt := vfsproxy.Options{
 		FsName:            v.FsName,
 		CacheDir:          v.CacheDir,
@@ -91,7 +76,6 @@ func (v *VFS) Provision(ctx caddy.Context) error {
 		StripDomain:       v.StripDomain,
 		MetadataCacheSize: v.MetadataCacheSize,
 		CacheMode:         v.CacheMode,
-		CachePollInterval: v.CachePollInterval,
 		WriteWait:         v.WriteWait,
 		ReadWait:          v.ReadWait,
 		WriteBack:         v.WriteBack,
@@ -212,23 +196,12 @@ func (v *VFS) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-				// Use caddy.ParseSize or similar if available, otherwise basic Atoi
-				// For simplicity using Atoi here
-				size, err := strconv.Atoi(d.Val())
-				if err != nil {
-					return d.Errf("invalid metadata_cache_size: %v", err)
-				}
-				v.MetadataCacheSize = size
+				v.MetadataCacheSize = d.Val()
 			case "cache_mode":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				v.CacheMode = d.Val()
-			case "poll_interval":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				v.CachePollInterval = d.Val()
 			case "write_wait":
 				if !d.NextArg() {
 					return d.ArgErr()

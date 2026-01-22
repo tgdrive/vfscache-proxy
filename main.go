@@ -26,12 +26,11 @@ var (
 	cacheChunkStreams = pflag.Int("chunk-streams", 2, "The number of parallel streams to read at once")
 	stripQuery        = pflag.Bool("strip-query", false, "Strip query parameters from URL for caching")
 	stripDomain       = pflag.Bool("strip-domain", false, "Strip domain and protocol from URL for caching")
-	metadataCacheSize = pflag.Int("metadata-cache-size", 5*1024*1024, "Size of the in-memory metadata cache")
-	fsName            = pflag.String("fs-name", "vfs-proxy", "The name of the VFS file system")
+	metadataCacheSize = pflag.String("metadata-cache-size", "5M", "Size of the in-memory metadata cache")
+	fsName            = pflag.String("fs-name", "link-vfs", "The name of the VFS file system")
 
 	// Additional VFS flags
 	cacheMode         = pflag.String("cache-mode", "full", "VFS cache mode (off, minimal, writes, full)")
-	cachePollInterval = pflag.String("poll-interval", "1m", "VFS cache poll interval")
 	writeWait         = pflag.String("write-wait", "1s", "VFS write wait time")
 	readWait          = pflag.String("read-wait", "20ms", "VFS read wait time")
 	writeBack         = pflag.String("write-back", "5s", "VFS write back time")
@@ -63,7 +62,6 @@ func main() {
 
 		// Map additional VFS flags
 		CacheMode:         *cacheMode,
-		CachePollInterval: *cachePollInterval,
 		WriteWait:         *writeWait,
 		ReadWait:          *readWait,
 		WriteBack:         *writeBack,

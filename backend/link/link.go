@@ -23,18 +23,7 @@ import (
 var (
 	errorReadOnly = errors.New("link: read only")
 	urlMap        sync.Map
-	metadataCache *freecache.Cache
-	cacheOnce     sync.Once
 )
-
-func InitCache(size int) {
-	cacheOnce.Do(func() {
-		if size < 512*1024 {
-			size = 512 * 1024 // Min 512KB
-		}
-		metadataCache = freecache.NewCache(size)
-	})
-}
 
 func Register(remote, url string) {
 	urlMap.Store(remote, url)
@@ -54,6 +43,7 @@ type Fs struct {
 	features    *fs.Features
 	stripQuery  bool
 	stripDomain bool
+	cache       *freecache.Cache
 }
 
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
@@ -67,6 +57,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if val, ok := m.Get("strip_domain"); ok && val == "true" {
 		f.stripDomain = true
+	}
+	if val, ok := m.Get("cache_size"); ok && val != "" {
+		var s fs.SizeSuffix
+		s.Set(val)
+		f.cache = freecache.NewCache(int(s))
 	}
 
 	f.features = (&fs.Features{
@@ -89,73 +84,13 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	var entries fs.DirEntries
 	urlMap.Range(func(key, value any) bool {
 		remote := key.(string)
-		// We use a lightweight check here, not full NewObject which might trigger network
-		// However, NewObject handles the cache check, so it should be fast if cached.
-		// For listing, we create objects.
-		u := value.(string)
-
-		// Ideally we need size/modtime for the listing.
-		// We can try to get it from cache without triggering a fetch.
-		obj, err := f.newObjectCached(ctx, remote, u)
+		obj, err := f.NewObject(ctx, remote)
 		if err == nil {
 			entries = append(entries, obj)
-		} else {
-			// Fallback: Return object with unknown size/time if not in cache?
-			// Rclone VFS might prefer knowing the object exists even if metadata is pending.
-			// Let's create a minimal object.
-			entries = append(entries, &Object{
-				fs:      f,
-				remote:  remote,
-				url:     u,
-				size:    -1, // Unknown
-				modTime: time.Now(),
-			})
 		}
 		return true
 	})
 	return entries, nil
-}
-
-// newObjectCached tries to create an object only if metadata is in cache
-func (f *Fs) newObjectCached(ctx context.Context, remote, u string) (fs.Object, error) {
-	if metadataCache == nil {
-		InitCache(5 * 1024 * 1024)
-	}
-
-	keyURL := u
-	if f.stripQuery || f.stripDomain {
-		if parsedURL, err := url.Parse(u); err == nil {
-			if f.stripQuery {
-				parsedURL.RawQuery = ""
-			}
-			if f.stripDomain {
-				parsedURL.Scheme = ""
-				parsedURL.Host = ""
-			}
-			keyURL = parsedURL.String()
-		}
-	}
-
-	keyHash := md5.Sum([]byte(keyURL))
-	cacheKey := keyHash[:]
-
-	if val, err := metadataCache.Get(cacheKey); err == nil && len(val) >= 16 {
-		size := int64(binary.LittleEndian.Uint64(val[:8]))
-		modTime := time.Unix(0, int64(binary.LittleEndian.Uint64(val[8:])))
-		mimeType := ""
-		if len(val) > 16 {
-			mimeType = string(val[16:])
-		}
-		return &Object{
-			fs:       f,
-			remote:   remote,
-			url:      u,
-			size:     size,
-			modTime:  modTime,
-			mimeType: mimeType,
-		}, nil
-	}
-	return nil, fs.ErrorObjectNotFound
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
@@ -164,10 +99,6 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, fs.ErrorObjectNotFound
 	}
 	u := val.(string)
-
-	if metadataCache == nil {
-		InitCache(5 * 1024 * 1024)
-	}
 
 	// Generate cache key from URL hash to avoid duplication
 	keyURL := u
@@ -187,21 +118,15 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	keyHash := md5.Sum([]byte(keyURL))
 	cacheKey := keyHash[:]
 
-	// Check cache
-	if val, err := metadataCache.Get(cacheKey); err == nil && len(val) >= 16 {
+	if val, err := f.cache.Get(cacheKey); err == nil && len(val) == 16 {
 		size := int64(binary.LittleEndian.Uint64(val[:8]))
 		modTime := time.Unix(0, int64(binary.LittleEndian.Uint64(val[8:])))
-		mimeType := ""
-		if len(val) > 16 {
-			mimeType = string(val[16:])
-		}
 		return &Object{
-			fs:       f,
-			remote:   remote,
-			url:      u,
-			size:     size,
-			modTime:  modTime,
-			mimeType: mimeType,
+			fs:      f,
+			remote:  remote,
+			url:     u,
+			size:    size,
+			modTime: modTime,
 		}, nil
 	}
 
@@ -223,15 +148,8 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 	resp, err := client.Do(req)
 
-	// Fallback to GET if HEAD is not allowed or supported
-	if err != nil || (resp.StatusCode != http.StatusOK) {
-		if err == nil {
-			log.Printf("HEAD failed with %d for %s (URL: %s), trying GET range...", resp.StatusCode, remote, u)
-			resp.Body.Close()
-		} else {
-			log.Printf("HEAD error for %s: %v, trying GET range...", remote, err)
-		}
-
+	// Fallback to GET if HEAD is not allowed or supported, or if size is unknown (-1)
+	if err != nil || (resp.StatusCode != http.StatusOK) || resp.ContentLength < 0 {
 		req, err = newReq("GET", u)
 		if err != nil {
 			return nil, err
@@ -270,25 +188,23 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 			modTime = t
 		}
 	}
-	mimeType := resp.Header.Get("Content-Type")
+
+	if size < 0 {
+		return nil, fmt.Errorf("metadata fetch failed: unknown file size for %s", u)
+	}
 
 	// Store in cache
-	// size (8) + modTime (8) + mimeType (variable)
-	buf := make([]byte, 16+len(mimeType))
+	buf := make([]byte, 16)
 	binary.LittleEndian.PutUint64(buf[:8], uint64(size))
 	binary.LittleEndian.PutUint64(buf[8:], uint64(modTime.UnixNano()))
-	if len(mimeType) > 0 {
-		copy(buf[16:], []byte(mimeType))
-	}
-	metadataCache.Set(cacheKey, buf, 3600) // 1 hour expiration
+	f.cache.Set(cacheKey, buf, 3600) // 1 hour expirationhour expiration
 
 	return &Object{
-		fs:       f,
-		remote:   remote,
-		url:      u,
-		size:     size,
-		modTime:  modTime,
-		mimeType: mimeType,
+		fs:      f,
+		remote:  remote,
+		url:     u,
+		size:    size,
+		modTime: modTime,
 	}, nil
 }
 
