@@ -29,7 +29,6 @@ archives:
         formats: [zip]
     files:
       - README*.md
-      - LICENSE
 
 dockers_v2:
   - images:
