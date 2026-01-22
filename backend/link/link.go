@@ -22,7 +22,8 @@ import (
 
 var (
 	errorReadOnly = errors.New("link: read only")
-	globalCache   *freecache.Cache
+	urlMap        sync.Map
+	metadataCache *freecache.Cache
 	cacheOnce     sync.Once
 )
 
@@ -31,15 +32,12 @@ func InitCache(size int) {
 		if size < 512*1024 {
 			size = 512 * 1024 // Min 512KB
 		}
-		globalCache = freecache.NewCache(size)
+		metadataCache = freecache.NewCache(size)
 	})
 }
 
 func Register(remote, url string) {
-	if globalCache == nil {
-		InitCache(5 * 1024 * 1024) // Default 5MB
-	}
-	_ = globalCache.Set([]byte("u:"+remote), []byte(url), 0)
+	urlMap.Store(remote, url)
 }
 
 func init() {
@@ -88,18 +86,88 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	if dir != "" {
 		return nil, fs.ErrorDirNotFound
 	}
-	return nil, nil // freecache cannot be iterated
+	var entries fs.DirEntries
+	urlMap.Range(func(key, value any) bool {
+		remote := key.(string)
+		// We use a lightweight check here, not full NewObject which might trigger network
+		// However, NewObject handles the cache check, so it should be fast if cached.
+		// For listing, we create objects.
+		u := value.(string)
+
+		// Ideally we need size/modtime for the listing.
+		// We can try to get it from cache without triggering a fetch.
+		obj, err := f.newObjectCached(ctx, remote, u)
+		if err == nil {
+			entries = append(entries, obj)
+		} else {
+			// Fallback: Return object with unknown size/time if not in cache?
+			// Rclone VFS might prefer knowing the object exists even if metadata is pending.
+			// Let's create a minimal object.
+			entries = append(entries, &Object{
+				fs:      f,
+				remote:  remote,
+				url:     u,
+				size:    -1, // Unknown
+				modTime: time.Now(),
+			})
+		}
+		return true
+	})
+	return entries, nil
+}
+
+// newObjectCached tries to create an object only if metadata is in cache
+func (f *Fs) newObjectCached(ctx context.Context, remote, u string) (fs.Object, error) {
+	if metadataCache == nil {
+		InitCache(5 * 1024 * 1024)
+	}
+
+	keyURL := u
+	if f.stripQuery || f.stripDomain {
+		if parsedURL, err := url.Parse(u); err == nil {
+			if f.stripQuery {
+				parsedURL.RawQuery = ""
+			}
+			if f.stripDomain {
+				parsedURL.Scheme = ""
+				parsedURL.Host = ""
+			}
+			keyURL = parsedURL.String()
+		}
+	}
+
+	keyHash := md5.Sum([]byte(keyURL))
+	cacheKey := keyHash[:]
+
+	if val, err := metadataCache.Get(cacheKey); err == nil && len(val) >= 16 {
+		size := int64(binary.LittleEndian.Uint64(val[:8]))
+		modTime := time.Unix(0, int64(binary.LittleEndian.Uint64(val[8:])))
+		mimeType := ""
+		if len(val) > 16 {
+			mimeType = string(val[16:])
+		}
+		return &Object{
+			fs:       f,
+			remote:   remote,
+			url:      u,
+			size:     size,
+			modTime:  modTime,
+			mimeType: mimeType,
+		}, nil
+	}
+	return nil, fs.ErrorObjectNotFound
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	if globalCache == nil {
-		InitCache(5 * 1024 * 1024)
-	}
-	val, err := globalCache.Get([]byte("u:" + remote))
-	if err != nil {
+	val, ok := urlMap.Load(remote)
+	if !ok {
 		return nil, fs.ErrorObjectNotFound
 	}
-	u := string(val)
+	u := val.(string)
+
+	if metadataCache == nil {
+		InitCache(5 * 1024 * 1024)
+	}
 
 	// Generate cache key from URL hash to avoid duplication
 	keyURL := u
@@ -117,10 +185,10 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	keyHash := md5.Sum([]byte(keyURL))
-	cacheKey := append([]byte("m:"), keyHash[:]...)
+	cacheKey := keyHash[:]
 
 	// Check cache
-	if val, err := globalCache.Get(cacheKey); err == nil && len(val) >= 16 {
+	if val, err := metadataCache.Get(cacheKey); err == nil && len(val) >= 16 {
 		size := int64(binary.LittleEndian.Uint64(val[:8]))
 		modTime := time.Unix(0, int64(binary.LittleEndian.Uint64(val[8:])))
 		mimeType := ""
@@ -212,7 +280,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if len(mimeType) > 0 {
 		copy(buf[16:], []byte(mimeType))
 	}
-	globalCache.Set(cacheKey, buf, 3600) // 1 hour expiration
+	metadataCache.Set(cacheKey, buf, 3600) // 1 hour expiration
 
 	return &Object{
 		fs:       f,
