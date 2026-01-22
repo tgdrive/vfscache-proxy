@@ -120,6 +120,9 @@ func (v *VFS) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		fullURL += "/"
 	}
 	fullURL += r.URL.Path
+	if r.URL.RawQuery != "" {
+		fullURL += "?" + r.URL.RawQuery
+	}
 
 	defer func() {
 		if r := recover(); r != nil {

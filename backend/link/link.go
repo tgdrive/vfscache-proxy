@@ -49,8 +49,13 @@ var (
 	urlMap        sync.Map
 )
 
-func Register(remote, url string) {
-	urlMap.Store(remote, url)
+type entry struct {
+	url    string
+	header http.Header
+}
+
+func Register(remote, url string, header http.Header) {
+	urlMap.Store(remote, &entry{url: url, header: header})
 }
 
 func Load(remote string) (string, bool) {
@@ -58,7 +63,7 @@ func Load(remote string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	return val.(string), true
+	return val.(*entry).url, true
 }
 
 func init() {
@@ -134,7 +139,8 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if !ok {
 		return nil, fs.ErrorObjectNotFound
 	}
-	u := val.(string)
+	e := val.(*entry)
+	u := e.url
 
 	// Generate cache key from URL hash to avoid duplication
 	keyURL := StripURL(u, f.stripQuery, f.stripDomain)
@@ -150,6 +156,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 				fs:      f,
 				remote:  remote,
 				url:     u,
+				header:  e.header,
 				size:    size,
 				modTime: modTime,
 			}, nil
@@ -165,6 +172,14 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
 		if err != nil {
 			return nil, err
+		}
+		if e.header != nil {
+			if v := e.header.Get("Authorization"); v != "" {
+				req.Header.Set("Authorization", v)
+			}
+			if v := e.header.Get("Cookie"); v != "" {
+				req.Header.Set("Cookie", v)
+			}
 		}
 		return req, nil
 	}
@@ -241,6 +256,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		fs:      f,
 		remote:  remote,
 		url:     u,
+		header:  e.header,
 		size:    size,
 		modTime: modTime,
 	}, nil
@@ -257,6 +273,7 @@ type Object struct {
 	fs       *Fs
 	remote   string
 	url      string
+	header   http.Header
 	size     int64
 	modTime  time.Time
 	mimeType string
@@ -283,6 +300,14 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	req, err := http.NewRequestWithContext(ctx, "GET", o.url, nil)
 	if err != nil {
 		return nil, err
+	}
+	if o.header != nil {
+		if v := o.header.Get("Authorization"); v != "" {
+			req.Header.Set("Authorization", v)
+		}
+		if v := o.header.Get("Cookie"); v != "" {
+			req.Header.Set("Cookie", v)
+		}
 	}
 	for k, v := range fs.OpenOptionHeaders(options) {
 		req.Header.Add(k, v)

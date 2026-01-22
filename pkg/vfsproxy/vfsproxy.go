@@ -140,7 +140,7 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, targetURL string
 
 	// Only register if not already present to avoid redundant map operations
 	if _, exists := link.Load(fileHash); !exists {
-		link.Register(fileHash, targetURL)
+		link.Register(fileHash, targetURL, r.Header)
 	}
 
 	h.ServeFile(w, r, fileHash)
