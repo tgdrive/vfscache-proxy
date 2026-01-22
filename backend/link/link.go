@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
@@ -138,21 +137,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	u := val.(string)
 
 	// Generate cache key from URL hash to avoid duplication
-	keyURL := u
-	if f.stripQuery || f.stripDomain {
-		if parsedURL, err := url.Parse(u); err == nil {
-			if f.stripQuery {
-				parsedURL.RawQuery = ""
-			}
-			if f.stripDomain {
-				parsedURL.Scheme = ""
-				parsedURL.Host = ""
-				parsedURL.User = nil
-				parsedURL.Fragment = ""
-			}
-			keyURL = parsedURL.String()
-		}
-	}
+	keyURL := StripURL(u, f.stripQuery, f.stripDomain)
 
 	keyHash := md5.Sum([]byte(keyURL))
 	cacheKey := keyHash[:]

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -157,21 +156,7 @@ func (h *Handler) getFileHash(targetURL string) string {
 	}
 
 	// Apply stripping to the URL before hashing
-	keyURL := targetURL
-	if h.stripQuery || h.stripDomain {
-		if parsedURL, err := url.Parse(targetURL); err == nil {
-			if h.stripQuery {
-				parsedURL.RawQuery = ""
-			}
-			if h.stripDomain {
-				parsedURL.Scheme = ""
-				parsedURL.Host = ""
-				parsedURL.User = nil
-				parsedURL.Fragment = ""
-			}
-			keyURL = parsedURL.String()
-		}
-	}
+	keyURL := link.StripURL(targetURL, h.stripQuery, h.stripDomain)
 
 	hashBytes := md5.Sum([]byte(keyURL))
 	fileHash = fmt.Sprintf("%x", hashBytes)
