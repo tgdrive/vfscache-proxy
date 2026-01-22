@@ -2,27 +2,18 @@ package main
 
 import (
 	"context"
-	"crypto/md5"
 	"encoding/base64"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"vfs/backend/link"
+	"github.com/tgdrive/vfscache-proxy/pkg/vfsproxy"
 
-	_ "github.com/rclone/rclone/backend/local"
-	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
-	"github.com/rclone/rclone/fs/config/configmap"
-	"github.com/rclone/rclone/fs/config/configstruct"
-	"github.com/rclone/rclone/vfs"
-	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/spf13/pflag"
 )
 
@@ -34,103 +25,90 @@ var (
 	cacheDir          = pflag.String("cache-dir", "", "Cache directory")
 	cacheChunkStreams = pflag.Int("chunk-streams", 2, "The number of parallel streams to read at once")
 	stripQuery        = pflag.Bool("strip-query", false, "Strip query parameters from URL for caching")
+	stripDomain       = pflag.Bool("strip-domain", false, "Strip domain and protocol from URL for caching")
+	metadataCacheSize = pflag.Int("metadata-cache-size", 5*1024*1024, "Size of the in-memory metadata cache")
+	fsName            = pflag.String("fs-name", "vfs-proxy", "The name of the VFS file system")
+
+	// Additional VFS flags
+	cacheMode         = pflag.String("cache-mode", "full", "VFS cache mode (off, minimal, writes, full)")
+	cachePollInterval = pflag.String("poll-interval", "1m", "VFS cache poll interval")
+	writeWait         = pflag.String("write-wait", "1s", "VFS write wait time")
+	readWait          = pflag.String("read-wait", "20ms", "VFS read wait time")
+	writeBack         = pflag.String("write-back", "5s", "VFS write back time")
+	dirCacheTime      = pflag.String("dir-cache-time", "0s", "VFS directory cache time")
+	fastFingerprint   = pflag.Bool("fast-fingerprint", false, "Use fast fingerprinting")
+	cacheMinFreeSpace = pflag.String("min-free-space", "off", "VFS minimum free space in cache")
+	caseInsensitive   = pflag.Bool("case-insensitive", false, "VFS case insensitive")
+	readOnly          = pflag.Bool("read-only", false, "VFS read only")
+	noModTime         = pflag.Bool("no-modtime", false, "VFS no modtime")
+	noChecksum        = pflag.Bool("no-checksum", false, "VFS no checksum")
+	noSeek            = pflag.Bool("no-seek", false, "VFS no seek")
+	dirPerms          = pflag.String("dir-perms", "0777", "VFS directory permissions")
+	filePerms         = pflag.String("file-perms", "0666", "VFS file permissions")
 )
 
-var globalVFS *vfs.VFS
-
-func initVFS() error {
+func main() {
 	pflag.Parse()
 
-	regInfo, _ := fs.Find("link")
-	if regInfo == nil {
-		return fmt.Errorf("could not find link backend")
+	opt := vfsproxy.Options{
+		FsName:            *fsName,
+		CacheDir:          *cacheDir,
+		CacheMaxAge:       *cacheMaxAge,
+		CacheMaxSize:      *cacheMaxSize,
+		CacheChunkSize:    *cacheChunkSize,
+		CacheChunkStreams: *cacheChunkStreams,
+		StripQuery:        *stripQuery,
+		StripDomain:       *stripDomain,
+		MetadataCacheSize: *metadataCacheSize,
+
+		// Map additional VFS flags
+		CacheMode:         *cacheMode,
+		CachePollInterval: *cachePollInterval,
+		WriteWait:         *writeWait,
+		ReadWait:          *readWait,
+		WriteBack:         *writeBack,
+		DirCacheTime:      *dirCacheTime,
+		FastFingerprint:   *fastFingerprint,
+		CacheMinFreeSpace: *cacheMinFreeSpace,
+		CaseInsensitive:   *caseInsensitive,
+		ReadOnly:          *readOnly,
+		NoModTime:         *noModTime,
+		NoChecksum:        *noChecksum,
+		NoSeek:            *noSeek,
+		DirPerms:          *dirPerms,
+		FilePerms:         *filePerms,
 	}
 
-	// Backend options
-	backendOpt := configmap.Simple{
-		"strip_query": fmt.Sprintf("%v", *stripQuery),
-	}
-
-	f, err := regInfo.NewFs(context.Background(), "link-vfs", "", backendOpt)
+	handler, err := vfsproxy.NewHandler(opt)
 	if err != nil {
-		return err
-	}
-
-	// Map our selected flags to Rclone VFS options
-	m := configmap.Simple{
-		"vfs_cache_mode":         "full",
-		"vfs_cache_max_age":      *cacheMaxAge,
-		"vfs_cache_max_size":     *cacheMaxSize,
-		"vfs-read-chunk-size":    *cacheChunkSize,
-		"dir_cache_time":         "0s",
-		"vfs_read_chunk_streams": fmt.Sprintf("%d", *cacheChunkStreams),
-	}
-
-	opt := vfscommon.Opt
-	if err := configstruct.Set(m, &opt); err != nil {
-		return fmt.Errorf("failed to parse VFS options: %w", err)
-	}
-
-	// Setup Cache Directory
-	actualCacheDir := *cacheDir
-	if actualCacheDir == "" {
-		actualCacheDir = filepath.Join(os.TempDir(), "rclone_vfs_cache")
-	}
-	_ = config.SetCacheDir(actualCacheDir)
-
-	globalVFS = vfs.New(f, &opt)
-	return nil
-}
-
-func streamHandler(w http.ResponseWriter, r *http.Request) {
-	targetURL := r.URL.Query().Get("url")
-
-	// Check for Base64 URL in path
-	if targetURL == "" && strings.HasPrefix(r.URL.Path, "/stream/") {
-		encodedURL := strings.TrimPrefix(r.URL.Path, "/stream/")
-		if decoded, err := base64.RawURLEncoding.DecodeString(encodedURL); err == nil {
-			targetURL = string(decoded)
-		} else if decoded, err := base64.URLEncoding.DecodeString(encodedURL); err == nil {
-			targetURL = string(decoded)
-		}
-	}
-
-	if targetURL == "" {
-		http.Error(w, "Missing 'url' parameter or base64 path", http.StatusBadRequest)
-		return
-	}
-
-	hashBytes := md5.Sum([]byte(targetURL))
-	fileHash := fmt.Sprintf("%x", hashBytes)
-
-	log.Printf("Request: %s -> %s", targetURL, fileHash)
-	link.Register(fileHash, targetURL)
-
-	handle, err := globalVFS.OpenFile(fileHash, os.O_RDONLY, 0)
-	if err != nil {
-		log.Printf("VFS error: %v", err)
-		http.Error(w, "File error", http.StatusNotFound)
-		return
-	}
-	defer handle.Close()
-
-	info, err := handle.Stat()
-	if err != nil {
-		http.Error(w, "Stat error", http.StatusInternalServerError)
-		return
-	}
-
-	http.ServeContent(w, r, fileHash, info.ModTime(), handle)
-}
-
-func main() {
-	if err := initVFS(); err != nil {
 		log.Fatal(err)
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", streamHandler)
-	mux.HandleFunc("/stream/", streamHandler)
+
+	mainHandler := func(w http.ResponseWriter, r *http.Request) {
+		targetURL := r.URL.Query().Get("url")
+
+		// Check for Base64 URL in path
+		if targetURL == "" && strings.HasPrefix(r.URL.Path, "/stream/") {
+			encodedURL := strings.TrimPrefix(r.URL.Path, "/stream/")
+			if decoded, err := base64.RawURLEncoding.DecodeString(encodedURL); err == nil {
+				targetURL = string(decoded)
+			} else if decoded, err := base64.URLEncoding.DecodeString(encodedURL); err == nil {
+				targetURL = string(decoded)
+			}
+		}
+
+		if targetURL == "" {
+			http.Error(w, "Missing 'url' parameter or base64 path", http.StatusBadRequest)
+			return
+		}
+
+		handler.Serve(w, r, targetURL)
+	}
+
+	mux.HandleFunc("/stream", mainHandler)
+	mux.HandleFunc("/stream/", mainHandler)
 
 	srv := &http.Server{
 		Addr:    ":" + *port,
@@ -143,7 +121,7 @@ func main() {
 
 	go func() {
 		log.Printf("VFS Proxy listening on :%s", *port)
-		log.Printf("VFS Cache Mode: %v", globalVFS.Opt.CacheMode)
+		log.Printf("VFS Cache Mode: %v", handler.VFS.Opt.CacheMode)
 		log.Printf("VFS Cache Dir: %s", config.GetCacheDir())
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %s\n", err)
@@ -163,7 +141,7 @@ func main() {
 	}
 
 	log.Println("Shutting down VFS...")
-	globalVFS.Shutdown()
+	handler.Shutdown()
 
 	log.Println("Exit")
 }

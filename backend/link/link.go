@@ -22,12 +22,24 @@ import (
 
 var (
 	errorReadOnly = errors.New("link: read only")
-	urlMap        sync.Map
-	metadataCache = freecache.NewCache(5 * 1024 * 1024) // 10MB cache
+	globalCache   *freecache.Cache
+	cacheOnce     sync.Once
 )
 
+func InitCache(size int) {
+	cacheOnce.Do(func() {
+		if size < 512*1024 {
+			size = 512 * 1024 // Min 512KB
+		}
+		globalCache = freecache.NewCache(size)
+	})
+}
+
 func Register(remote, url string) {
-	urlMap.Store(remote, url)
+	if globalCache == nil {
+		InitCache(5 * 1024 * 1024) // Default 5MB
+	}
+	_ = globalCache.Set([]byte("u:"+remote), []byte(url), 0)
 }
 
 func init() {
@@ -39,10 +51,11 @@ func init() {
 }
 
 type Fs struct {
-	name       string
-	root       string
-	features   *fs.Features
-	stripQuery bool
+	name        string
+	root        string
+	features    *fs.Features
+	stripQuery  bool
+	stripDomain bool
 }
 
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
@@ -53,6 +66,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Parse backend options
 	if val, ok := m.Get("strip_query"); ok && val == "true" {
 		f.stripQuery = true
+	}
+	if val, ok := m.Get("strip_domain"); ok && val == "true" {
+		f.stripDomain = true
 	}
 
 	f.features = (&fs.Features{
@@ -72,47 +88,52 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	if dir != "" {
 		return nil, fs.ErrorDirNotFound
 	}
-	var entries fs.DirEntries
-	urlMap.Range(func(key, value any) bool {
-		remote := key.(string)
-		obj, err := f.NewObject(ctx, remote)
-		if err == nil {
-			entries = append(entries, obj)
-		}
-		return true
-	})
-	return entries, nil
+	return nil, nil // freecache cannot be iterated
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	val, ok := urlMap.Load(remote)
-	if !ok {
+	if globalCache == nil {
+		InitCache(5 * 1024 * 1024)
+	}
+	val, err := globalCache.Get([]byte("u:" + remote))
+	if err != nil {
 		return nil, fs.ErrorObjectNotFound
 	}
-	u := val.(string)
+	u := string(val)
 
 	// Generate cache key from URL hash to avoid duplication
 	keyURL := u
-	if f.stripQuery {
+	if f.stripQuery || f.stripDomain {
 		if parsedURL, err := url.Parse(u); err == nil {
-			parsedURL.RawQuery = ""
+			if f.stripQuery {
+				parsedURL.RawQuery = ""
+			}
+			if f.stripDomain {
+				parsedURL.Scheme = ""
+				parsedURL.Host = ""
+			}
 			keyURL = parsedURL.String()
 		}
 	}
 
 	keyHash := md5.Sum([]byte(keyURL))
-	cacheKey := keyHash[:]
+	cacheKey := append([]byte("m:"), keyHash[:]...)
 
 	// Check cache
-	if val, err := metadataCache.Get(cacheKey); err == nil && len(val) == 16 {
+	if val, err := globalCache.Get(cacheKey); err == nil && len(val) >= 16 {
 		size := int64(binary.LittleEndian.Uint64(val[:8]))
 		modTime := time.Unix(0, int64(binary.LittleEndian.Uint64(val[8:])))
+		mimeType := ""
+		if len(val) > 16 {
+			mimeType = string(val[16:])
+		}
 		return &Object{
-			fs:      f,
-			remote:  remote,
-			url:     u,
-			size:    size,
-			modTime: modTime,
+			fs:       f,
+			remote:   remote,
+			url:      u,
+			size:     size,
+			modTime:  modTime,
+			mimeType: mimeType,
 		}, nil
 	}
 
@@ -181,19 +202,25 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 			modTime = t
 		}
 	}
+	mimeType := resp.Header.Get("Content-Type")
 
 	// Store in cache
-	buf := make([]byte, 16)
+	// size (8) + modTime (8) + mimeType (variable)
+	buf := make([]byte, 16+len(mimeType))
 	binary.LittleEndian.PutUint64(buf[:8], uint64(size))
 	binary.LittleEndian.PutUint64(buf[8:], uint64(modTime.UnixNano()))
-	metadataCache.Set(cacheKey, buf, 3600) // 1 hour expiration
+	if len(mimeType) > 0 {
+		copy(buf[16:], []byte(mimeType))
+	}
+	globalCache.Set(cacheKey, buf, 3600) // 1 hour expiration
 
 	return &Object{
-		fs:      f,
-		remote:  remote,
-		url:     u,
-		size:    size,
-		modTime: modTime,
+		fs:       f,
+		remote:   remote,
+		url:      u,
+		size:     size,
+		modTime:  modTime,
+		mimeType: mimeType,
 	}, nil
 }
 
@@ -205,11 +232,12 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error { return nil }
 func (f *Fs) Rmdir(ctx context.Context, dir string) error { return errorReadOnly }
 
 type Object struct {
-	fs      *Fs
-	remote  string
-	url     string
-	size    int64
-	modTime time.Time
+	fs       *Fs
+	remote   string
+	url      string
+	size     int64
+	modTime  time.Time
+	mimeType string
 }
 
 func (o *Object) Fs() fs.Info    { return o.fs }
@@ -220,6 +248,7 @@ func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
 }
 func (o *Object) Size() int64                                             { return o.size }
 func (o *Object) ModTime(ctx context.Context) time.Time                   { return o.modTime }
+func (o *Object) MimeType(ctx context.Context) string                     { return o.mimeType }
 func (o *Object) Storable() bool                                          { return true }
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error { return errorReadOnly }
 func (o *Object) Remove(ctx context.Context) error                        { return errorReadOnly }

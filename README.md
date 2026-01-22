@@ -44,6 +44,8 @@ You can pass any CLI flags (see below) to the end of the docker run command.
 | `--max-age` | `1h` | Max age of files in the VFS cache. |
 | `--max-size` | `off` | Max total size of objects in the cache. |
 | `--strip-query` | `false` | If true, strips query parameters from the URL when generating the cache key. Useful for signed URLs. |
+| `--strip-domain` | `false` | If true, strips domain and protocol from the URL when generating the cache key. Useful for content mirrored across multiple domains. |
+| `--metadata-cache-size` | `5M` | Size of the in-memory metadata cache. |
 
 ## API Endpoints
 
@@ -64,6 +66,83 @@ Useful for tools or players that struggle with query parameters in URLs.
 ```http
 GET /stream/aHR0cHM6Ly9leGFtcGxlLmNvbS92aWRlby5tcDQ
 ```
+
+## Caddy Plugin
+
+VFS Cache Proxy can be used as a Caddy module. This allows Caddy to act as a high-performance caching reverse proxy for specific upstreams.
+
+### 1. Build with xcaddy
+
+Since this is a Go plugin, you must compile it into Caddy:
+
+```bash
+xcaddy build \
+    --with github.com/tgdrive/vfscache-proxy/caddy
+```
+
+### 2. Caddyfile Usage
+
+#### Pattern A: Simple Reverse Proxy
+Acts as a transparent caching layer for an upstream server.
+
+```caddyfile
+:8080 {
+    vfs https://upstream.com {
+        cache_dir /var/cache/vfs
+        max_age 24h
+    }
+}
+```
+*Request:* `GET /movie.mp4` -> *Fetches & Caches:* `https://upstream.com/movie.mp4`
+
+#### Pattern B: Specific Route
+Only proxy specific paths through the VFS layer.
+
+```caddyfile
+example.com {
+    route /media/* {
+        vfs https://s3.amazonaws.com/my-bucket {
+            chunk_size 128M
+            chunk_streams 4
+        }
+    }
+    
+    # Other standard Caddy logic
+    file_server browse
+}
+```
+
+#### Pattern C: Stripping Prefix (`handle_path`)
+Useful if the upstream does not expect the local path prefix.
+
+```caddyfile
+:8080 {
+    handle_path /stream/* {
+        vfs https://cdn.example.net {
+            strip_domain
+            strip_query
+        }
+    }
+}
+```
+
+### Caddyfile Directives
+
+| Directive | Description |
+|-----------|-------------|
+| `upstream` (arg) | **Required**. The base URL of the source server. |
+| `cache_dir` | Directory for the VFS disk cache. |
+| `max_age` | Max age of files in cache (e.g., `1h`, `24h`). |
+| `max_size` | Max total size of the disk cache. |
+| `chunk_size` | Chunk size for read requests (default `64M`). |
+| `chunk_streams` | Parallel download streams per request. |
+| `strip_query` | Strip query parameters for the metadata cache key. |
+| `strip_domain` | Strip domain/protocol for the metadata cache key. |
+| `metadata_cache_size` | Size of the in-memory metadata cache (default `5M`). |
+| `fs_name` | Custom name for the VFS file system. |
+| `cache_mode` | VFS cache mode (`off`, `minimal`, `writes`, `full`). |
+
+---
 
 ## How it Works
 
