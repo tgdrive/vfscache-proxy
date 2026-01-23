@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 
@@ -19,35 +20,83 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"github.com/spf13/pflag"
 	"github.com/tgdrive/vfscache-proxy/backend/link"
 )
 
 type Options struct {
-	FsName            string
-	CacheDir          string
-	CacheMaxAge       string
-	CacheMaxSize      string
-	CacheChunkSize    string
-	CacheChunkStreams int
-	StripQuery        bool
-	StripDomain       bool
-	ShardLevel        int
+	FsName            string `vfs:"-" flag:"fs-name" caddy:"fs_name" help:"The name of the VFS file system"`
+	CacheDir          string `vfs:"-" flag:"cache-dir" caddy:"cache_dir" help:"Cache directory"`
+	CacheMaxAge       string `vfs:"vfs_cache_max_age" flag:"max-age" caddy:"max_age" help:"Max age of files in cache"`
+	CacheMaxSize      string `vfs:"vfs_cache_max_size" flag:"max-size" caddy:"max_size" help:"Max total size of objects in cache"`
+	CacheChunkSize    string `vfs:"vfs_read_chunk_size" flag:"chunk-size" caddy:"chunk_size" help:"Default Chunk size of read request"`
+	CacheChunkStreams int    `vfs:"vfs_read_chunk_streams" flag:"chunk-streams" caddy:"chunk_streams" help:"The number of parallel streams to read at once"`
+	StripQuery        bool   `vfs:"-" flag:"strip-query" caddy:"strip_query" help:"Strip query parameters from URL for caching"`
+	StripDomain       bool   `vfs:"-" flag:"strip-domain" caddy:"strip_domain" help:"Strip domain and protocol from URL for caching"`
+	ShardLevel        int    `vfs:"-" flag:"shard-level" caddy:"shard-level" help:"Number of shard levels"`
 
 	// Additional VFS Options
-	CacheMode         string
-	WriteWait         string
-	ReadWait          string
-	WriteBack         string
-	DirCacheTime      string
-	FastFingerprint   bool
-	CacheMinFreeSpace string
-	CaseInsensitive   bool
-	ReadOnly          bool
-	NoModTime         bool
-	NoChecksum        bool
-	NoSeek            bool
-	DirPerms          string
-	FilePerms         string
+	CacheMode         string `vfs:"vfs_cache_mode" flag:"cache-mode" caddy:"cache_mode" help:"VFS cache mode (off, minimal, writes, full)"`
+	WriteWait         string `vfs:"vfs_write_wait" flag:"write-wait" caddy:"write_wait" help:"VFS write wait time"`
+	ReadWait          string `vfs:"vfs_read_wait" flag:"read-wait" caddy:"read_wait" help:"VFS read wait time"`
+	WriteBack         string `vfs:"vfs_write_back" flag:"write-back" caddy:"write_back" help:"VFS write back time"`
+	DirCacheTime      string `vfs:"dir_cache_time" flag:"dir-cache-time" caddy:"dir_cache_time" help:"VFS directory cache time"`
+	FastFingerprint   bool   `vfs:"vfs_fast_fingerprint" flag:"fast-fingerprint" caddy:"fast_fingerprint" help:"Use fast fingerprinting"`
+	CacheMinFreeSpace string `vfs:"vfs_cache_min_free_space" flag:"min-free-space" caddy:"min_free_space" help:"VFS minimum free space in cache"`
+	CaseInsensitive   bool   `vfs:"vfs_case_insensitive" flag:"case-insensitive" caddy:"case_insensitive" help:"VFS case insensitive"`
+	ReadOnly          bool   `vfs:"read_only" flag:"read-only" caddy:"read_only" help:"VFS read only"`
+	NoModTime         bool   `vfs:"no_modtime" flag:"no-modtime" caddy:"no_modtime" help:"VFS no modtime"`
+	NoChecksum        bool   `vfs:"no_checksum" flag:"no-checksum" caddy:"no_checksum" help:"VFS no checksum"`
+	NoSeek            bool   `vfs:"no_seek" flag:"no-seek" caddy:"no_seek" help:"VFS no seek"`
+	DirPerms          string `vfs:"dir_perms" flag:"dir-perms" caddy:"dir_perms" help:"VFS directory permissions"`
+	FilePerms         string `vfs:"file_perms" flag:"file-perms" caddy:"file_perms" help:"VFS file permissions"`
+}
+
+// AddFlags adds flags to the given FlagSet.
+func (opt *Options) AddFlags(fs *pflag.FlagSet) {
+	v := reflect.ValueOf(opt).Elem()
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		flagName := field.Tag.Get("flag")
+		if flagName == "" || flagName == "-" {
+			continue
+		}
+		help := field.Tag.Get("help")
+		f := v.Field(i)
+		switch f.Kind() {
+		case reflect.String:
+			fs.StringVar(f.Addr().Interface().(*string), flagName, f.String(), help)
+		case reflect.Int:
+			fs.IntVar(f.Addr().Interface().(*int), flagName, int(f.Int()), help)
+		case reflect.Bool:
+			fs.BoolVar(f.Addr().Interface().(*bool), flagName, f.Bool(), help)
+		}
+	}
+}
+
+// ToConfigMap converts Options to a rclone configmap.
+func (opt *Options) ToConfigMap() configmap.Simple {
+	m := configmap.Simple{}
+	v := reflect.ValueOf(opt).Elem()
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		tag := field.Tag.Get("vfs")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		f := v.Field(i)
+		switch f.Kind() {
+		case reflect.String:
+			m[tag] = f.String()
+		case reflect.Int:
+			m[tag] = strconv.Itoa(int(f.Int()))
+		case reflect.Bool:
+			m[tag] = strconv.FormatBool(f.Bool())
+		}
+	}
+	return m
 }
 
 // DefaultOptions returns Options with sensible defaults applied from rclone.
@@ -57,54 +106,34 @@ func DefaultOptions() Options {
 		ShardLevel: 1,
 	}
 
-	// Fetch defaults from rclone vfscommon.Opt
 	vfsOpt := vfscommon.Opt
 	items, err := configstruct.Items(&vfsOpt)
 	if err != nil {
-		return opt // Fallback to minimal defaults on error
+		return opt
 	}
+
+	optValue := reflect.ValueOf(&opt).Elem()
+	optType := optValue.Type()
 
 	for _, item := range items {
 		valStr, _ := configstruct.InterfaceToString(item.Value)
-		switch item.Name {
-		case "vfs_cache_mode":
-			opt.CacheMode = valStr
-		case "vfs_cache_max_age":
-			opt.CacheMaxAge = valStr
-		case "vfs_cache_max_size":
-			opt.CacheMaxSize = valStr
-		case "vfs_read_chunk_size":
-			opt.CacheChunkSize = valStr
-		case "vfs_read_chunk_streams":
-			if i, err := strconv.Atoi(valStr); err == nil {
-				opt.CacheChunkStreams = i
+		for i := 0; i < optType.NumField(); i++ {
+			field := optType.Field(i)
+			tag := field.Tag.Get("vfs")
+			if tag == item.Name {
+				f := optValue.Field(i)
+				switch f.Kind() {
+				case reflect.String:
+					f.SetString(valStr)
+				case reflect.Int:
+					if val, err := strconv.Atoi(valStr); err == nil {
+						f.SetInt(int64(val))
+					}
+				case reflect.Bool:
+					f.SetBool(valStr == "true")
+				}
+				break
 			}
-		case "vfs_write_wait":
-			opt.WriteWait = valStr
-		case "vfs_read_wait":
-			opt.ReadWait = valStr
-		case "vfs_write_back":
-			opt.WriteBack = valStr
-		case "dir_cache_time":
-			opt.DirCacheTime = valStr
-		case "vfs_fast_fingerprint":
-			opt.FastFingerprint = (valStr == "true")
-		case "vfs_cache_min_free_space":
-			opt.CacheMinFreeSpace = valStr
-		case "vfs_case_insensitive":
-			opt.CaseInsensitive = (valStr == "true")
-		case "read_only":
-			opt.ReadOnly = (valStr == "true")
-		case "no_modtime":
-			opt.NoModTime = (valStr == "true")
-		case "no_checksum":
-			opt.NoChecksum = (valStr == "true")
-		case "no_seek":
-			opt.NoSeek = (valStr == "true")
-		case "dir_perms":
-			opt.DirPerms = valStr
-		case "file_perms":
-			opt.FilePerms = valStr
 		}
 	}
 
@@ -142,26 +171,7 @@ func NewHandler(opt Options) (*Handler, error) {
 
 	// Configure VFS options
 	vfsOpt := vfscommon.Opt
-	optMap := configmap.Simple{
-		"vfs_cache_mode":           opt.CacheMode,
-		"vfs_cache_max_age":        opt.CacheMaxAge,
-		"vfs_cache_max_size":       opt.CacheMaxSize,
-		"vfs_read_chunk_size":      opt.CacheChunkSize,
-		"vfs_read_chunk_streams":   strconv.Itoa(opt.CacheChunkStreams),
-		"vfs_write_wait":           opt.WriteWait,
-		"vfs_read_wait":            opt.ReadWait,
-		"vfs_write_back":           opt.WriteBack,
-		"dir_cache_time":           opt.DirCacheTime,
-		"vfs_fast_fingerprint":     strconv.FormatBool(opt.FastFingerprint),
-		"vfs_cache_min_free_space": opt.CacheMinFreeSpace,
-		"vfs_case_insensitive":     strconv.FormatBool(opt.CaseInsensitive),
-		"read_only":                strconv.FormatBool(opt.ReadOnly),
-		"no_modtime":               strconv.FormatBool(opt.NoModTime),
-		"no_checksum":              strconv.FormatBool(opt.NoChecksum),
-		"no_seek":                  strconv.FormatBool(opt.NoSeek),
-		"dir_perms":                opt.DirPerms,
-		"file_perms":               opt.FilePerms,
-	}
+	optMap := opt.ToConfigMap()
 
 	if err := configstruct.Set(optMap, &vfsOpt); err != nil {
 		return nil, fmt.Errorf("failed to parse VFS options: %w", err)

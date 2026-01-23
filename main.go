@@ -19,68 +19,12 @@ import (
 
 var (
 	port = pflag.String("port", "8080", "Port to listen on")
-
-	// Use DefaultOptions to get all defaults
-	defaults = vfsproxy.DefaultOptions()
-
-	// Core options
-	fsName            = pflag.String("fs-name", defaults.FsName, "The name of the VFS file system")
-	cacheDir          = pflag.String("cache-dir", defaults.CacheDir, "Cache directory")
-	cacheMaxAge       = pflag.String("max-age", defaults.CacheMaxAge, "Max age of files in cache")
-	cacheMaxSize      = pflag.String("max-size", defaults.CacheMaxSize, "Max total size of objects in cache")
-	cacheChunkSize    = pflag.String("chunk-size", defaults.CacheChunkSize, "Default Chunk size of read request")
-	cacheChunkStreams = pflag.Int("chunk-streams", defaults.CacheChunkStreams, "The number of parallel streams to read at once")
-	stripQuery        = pflag.Bool("strip-query", defaults.StripQuery, "Strip query parameters from URL for caching")
-	stripDomain       = pflag.Bool("strip-domain", defaults.StripDomain, "Strip domain and protocol from URL for caching")
-	shardLevel        = pflag.Int("shard-level", defaults.ShardLevel, "Number of shard levels")
-
-	// Additional VFS flags
-	cacheMode         = pflag.String("cache-mode", defaults.CacheMode, "VFS cache mode (off, minimal, writes, full)")
-	writeWait         = pflag.String("write-wait", defaults.WriteWait, "VFS write wait time")
-	readWait          = pflag.String("read-wait", defaults.ReadWait, "VFS read wait time")
-	writeBack         = pflag.String("write-back", defaults.WriteBack, "VFS write back time")
-	dirCacheTime      = pflag.String("dir-cache-time", defaults.DirCacheTime, "VFS directory cache time")
-	fastFingerprint   = pflag.Bool("fast-fingerprint", defaults.FastFingerprint, "Use fast fingerprinting")
-	cacheMinFreeSpace = pflag.String("min-free-space", defaults.CacheMinFreeSpace, "VFS minimum free space in cache")
-	caseInsensitive   = pflag.Bool("case-insensitive", defaults.CaseInsensitive, "VFS case insensitive")
-	readOnly          = pflag.Bool("read-only", defaults.ReadOnly, "VFS read only")
-	noModTime         = pflag.Bool("no-modtime", defaults.NoModTime, "VFS no modtime")
-	noChecksum        = pflag.Bool("no-checksum", defaults.NoChecksum, "VFS no checksum")
-	noSeek            = pflag.Bool("no-seek", defaults.NoSeek, "VFS no seek")
-	dirPerms          = pflag.String("dir-perms", defaults.DirPerms, "VFS directory permissions")
-	filePerms         = pflag.String("file-perms", defaults.FilePerms, "VFS file permissions")
+	opt  = vfsproxy.DefaultOptions()
 )
 
 func main() {
+	opt.AddFlags(pflag.CommandLine)
 	pflag.Parse()
-
-	opt := vfsproxy.Options{
-		FsName:            *fsName,
-		CacheDir:          *cacheDir,
-		CacheMaxAge:       *cacheMaxAge,
-		CacheMaxSize:      *cacheMaxSize,
-		CacheChunkSize:    *cacheChunkSize,
-		CacheChunkStreams: *cacheChunkStreams,
-		StripQuery:        *stripQuery,
-		StripDomain:       *stripDomain,
-		ShardLevel:        *shardLevel,
-
-		// Map additional VFS flags
-		CacheMode:         *cacheMode,
-		WriteWait:         *writeWait,
-		ReadWait:          *readWait,
-		WriteBack:         *writeBack,
-		DirCacheTime:      *dirCacheTime,
-		FastFingerprint:   *fastFingerprint,
-		CacheMinFreeSpace: *cacheMinFreeSpace,
-		CaseInsensitive:   *caseInsensitive,
-		ReadOnly:          *readOnly,
-		NoModTime:         *noModTime,
-		NoChecksum:        *noChecksum,
-		NoSeek:            *noSeek,
-		DirPerms:          *dirPerms,
-		FilePerms:         *filePerms,
-	}
 
 	handler, err := vfsproxy.NewHandler(opt)
 	if err != nil {
